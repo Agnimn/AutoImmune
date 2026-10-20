@@ -1,0 +1,29 @@
+.venv/
+
+# Python caches & bytecode
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Environment & secrets
+.env
+
+# Build artifacts
+app/target/
+
+runs/*
+!runs/.gitkeep
+cache/*
+!cache/.gitkeep
+!cache/*.json
+results/*
+!results/.gitkeep
+
+# Evaluator-only benchmark assets (never published)
+**/hidden_tests/
+**/labels.json
+
+# OS and IDE metadata
+.DS_Store
+Thumbs.db

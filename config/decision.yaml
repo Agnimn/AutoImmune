@@ -1,0 +1,35 @@
+# Decision thresholds (placeholders; tune before experiments).
+max_diff_lines: 20
+# Diagnosis sampling (H1): number of samples per diagnosis call and temperature for samples after the first.
+# 1 sample = no agreement check (samples_disagree stays None). 3 samples enables disagreement detection.
+diag_samples: 1
+diag_temperature: 0.7
+latency_limit_ms: 2000
+health_window_s: 30
+check_interval_s: 3
+poll_interval_s: 5
+consecutive_failures: 2
+sensitive_paths:
+  - "application.properties"
+  - "security/"
+# Sandbox: timeout per gate container, in seconds (V3 applies it to each of its two Semgrep scans).
+# A timeout is never a pass.
+gate_timeouts_s:
+  V0: 300
+  V1: 300
+  V2: 600
+  V3: 300
+# Deployment: order-service listens on app_port inside its container; Docker maps it to host_port
+# (host 8080 is taken on the dev laptop, so 18080 there).
+app_port: 8080
+host_port: 18080
+# Orchestrator: how long detector.watch may run before a missing incident is an error.
+detect_timeout_s: 60
+# Detector metrics rule over /actuator/prometheus (http.server.requests; /actuator/** traffic excluded).
+# A window is the current scrape compared with the scrape window_s earlier; windows with fewer than
+# min_requests requests are not judged.
+metrics:
+  window_s: 15
+  min_requests: 20
+  max_5xx_share: 0.05
+  max_p95_ms: 2000
