@@ -33,23 +33,29 @@ validated across F01/F04/F06). The following items remain and require a live or 
 
 ## Step-by-step instructions
 
-### 1. Configure the endpoint
+### 1. Install Ollama and pull the model
 
+1. Download and install Ollama from [https://ollama.com](https://ollama.com).
+2. Pull the target model in your terminal:
+   ```powershell
+   ollama pull qwen2.5-coder:7b
+   ```
+3. Ensure Ollama is running (`curl http://localhost:11434/api/tags` or check the taskbar icon).
+
+### 2. Configure environment variables in your terminal
+
+Python reads directly from your shell environment (it does not auto-load `.env`). Set the variables in your active terminal:
+
+**In PowerShell:**
 ```powershell
-copy .env.example .env
+$env:LLM_BASE_URL = "http://localhost:11434/v1"
+$env:LLM_MODEL    = "qwen2.5-coder:7b"
+$env:LLM_API_KEY  = ""  # optional for local Ollama
 ```
 
-Edit `.env` and set exactly these three variables (no other keys go here):
+*(In Linux / macOS bash, use `export LLM_BASE_URL="http://localhost:11434/v1"`, `export LLM_MODEL="qwen2.5-coder:7b"`, `export LLM_API_KEY=""`)*
 
-```
-LLM_BASE_URL=http://localhost:11434/v1    # Ollama local, or your hosted API base URL
-LLM_MODEL=qwen2.5-coder:7b               # or the model name your provider uses
-LLM_API_KEY=                             # empty for Ollama; your token for hosted APIs
-```
-
-**Never commit `.env`.** It is already in `.gitignore`.
-
-### 2. Verify the connection
+### 3. Verify the connection via smoke test
 
 ```powershell
 .venv\Scripts\python.exe tools\llm_smoke.py

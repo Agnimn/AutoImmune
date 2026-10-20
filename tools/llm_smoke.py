@@ -55,10 +55,10 @@ def main():
 
     print(f"=== AutoImmune LLM Smoke Test (F06) [mode={args.mode}, samples={args.samples}] ===")
     if args.mode == "live":
-        missing = [k for k in ("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY") if not os.environ.get(k)]
+        missing = [k for k in ("LLM_BASE_URL", "LLM_MODEL") if not os.environ.get(k)]
         if missing:
             print(f"ERROR: Missing environment variables for live mode: {', '.join(missing)}", file=sys.stderr)
-            print("Set them before running: export LLM_BASE_URL=... LLM_MODEL=... LLM_API_KEY=...", file=sys.stderr)
+            print("Set them before running: export LLM_BASE_URL=... LLM_MODEL=...", file=sys.stderr)
             sys.exit(1)
         print(f"Base URL: {os.environ.get('LLM_BASE_URL')}")
         print(f"Model:    {os.environ.get('LLM_MODEL')}")
