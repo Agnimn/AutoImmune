@@ -111,7 +111,8 @@ docker pull alpine:latest
 .venv\Scripts\python.exe -m pytest
 ```
 
-Expected: **170 passed, 0 failed, 0 skipped**  
+Latest recorded result: **174 passed, 0 failed, 0 skipped**.
+This is a recorded result, not a guaranteed count for future runs.
 Approximate duration: 13–15 minutes (Docker sandbox tests dominate).
 
 Non-Docker tests only (fast path, ~30 seconds):
@@ -221,6 +222,24 @@ Writes `results/units.csv`, `decisions_by_fault.csv`, `unsafe_first_stop.csv`, `
 
 Output is deterministic: same inputs produce byte-identical files.
 
+## 11.1. Regenerate the offline evidence dashboard
+
+Run this command from the repository root in Windows PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe tools\make_dashboard.py
+```
+
+The default output is `results/dashboard.html`.
+
+To specify the output path explicitly:
+
+```powershell
+.\.venv\Scripts\python.exe tools\make_dashboard.py --out results\dashboard.html
+```
+
+The dashboard is a self-contained HTML report generated from repository evidence, analysis outputs, and documentation. Regenerate the analysis report first when the underlying evidence has changed.
+
 ---
 
 ## 12. Linux equivalents
@@ -255,7 +274,7 @@ Replace PowerShell backtick `` ` `` for line continuation with `\`.
 - [ ] Docker Desktop running and healthy
 - [ ] All Docker images present (`docker images`)
 - [ ] `autoimmune-m2` volume present (`docker volume ls`)
-- [ ] Full test suite passes: `pytest` → 170 passed, 0 failed
+- [ ] Full test suite passes: run `pytest` and verify 0 failures (historical records: 170 passed Phase 5 baseline; 174 passed recorded with dashboard tests)
 - [ ] Rehearsed run saved in `runs/` (at least one F06, F01, F04 run)
 - [ ] `analyse.py` produces `results/pilot_report.md` with 16 units
 
@@ -267,7 +286,7 @@ Replace PowerShell backtick `` ` `` for line continuation with `\`.
 
 ### Demo steps (plan section 8.2)
 
-1. **Show banner** — `python -m pipeline run --fault F06 --diag-mode rule --patch-mode scripted`  
+1. **Show banner** — `python -m pipeline run --fault F06 --diag-mode rule --patch-mode scripted`
    → Banner shows `fault=F06  diag_mode=rule  patch_mode=scripted  (no LLM: rule/scripted results)`
 
 2. **Detection** — Faulty build deployed; detector raises probe_mismatch incident within 60 s

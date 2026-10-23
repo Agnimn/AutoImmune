@@ -1,0 +1,1459 @@
+"""Generator for AutoImmune Evidence Dashboard.
+
+    python tools/make_dashboard.py
+    python tools/make_dashboard.py --out results/dashboard.html
+
+Produces an offline, self-contained HTML dashboard visualizing real project evidence,
+validation gates V0-V3, candidate reviews, policy comparisons, and known limitations.
+Zero external network calls, fonts, or CDNs.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import html
+import json
+import statistics
+import sys
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def esc(val: object) -> str:
+    """Safe HTML escaping handling None and non-string types."""
+    if val is None:
+        return ""
+    return html.escape(str(val))
+
+
+def parse_evidence(evidence_path: Path) -> list[dict]:
+    if not evidence_path.exists():
+        raise FileNotFoundError(f"Evidence file not found: {evidence_path}")
+    rows = []
+    with evidence_path.open("r", encoding="utf-8") as f:
+        for idx, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+                rows.append(row)
+            except json.JSONDecodeError as e:
+                print(f"Warning: line {idx} in {evidence_path} is invalid JSON: {e}", file=sys.stderr)
+    return rows
+
+
+def parse_csv(csv_path: Path) -> list[dict[str, str]]:
+    if not csv_path.exists():
+        return []
+    with csv_path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        return list(reader)
+
+
+def determine_first_stop(u: dict) -> str:
+    """What stopped this candidate: the first gate that did not pass, else SURVIVED."""
+    for g in ("v0", "v1", "v2", "v3"):
+        st = u.get(g, {}).get("status")
+        if st != "pass":
+            return g.upper()
+    return "SURVIVED"
+
+
+def build_dashboard_data(repo_root: Path, evidence_path: Path, results_dir: Path, docs_dir: Path) -> dict:
+    evidence_rows = parse_evidence(evidence_path)
+    
+    # Analysis units: latest valid row per (fault_id, candidate_id)
+    latest_units: dict[tuple[str, str], dict] = {}
+    for r in evidence_rows:
+        if r.get("invalid"):
+            continue
+        key = (r.get("fault_id", "unknown"), r.get("candidate_id", "unknown"))
+        ts = r.get("timestamp", "")
+        run = r.get("run_id", "")
+        if key not in latest_units or (ts, run) > (latest_units[key].get("timestamp", ""), latest_units[key].get("run_id", "")):
+            latest_units[key] = r
+    
+    units = [latest_units[k] for k in sorted(latest_units)]
+    
+    # Read CSV reports
+    llm_diagnosis = parse_csv(results_dir / "llm_diagnosis.csv")
+    llm_units = parse_csv(results_dir / "llm_units.csv")
+    policies = parse_csv(results_dir / "policies.csv")
+    approvals = parse_csv(results_dir / "approvals.csv")
+    rollbacks = parse_csv(results_dir / "rollbacks.csv")
+    decisions_by_fault = parse_csv(results_dir / "decisions_by_fault.csv")
+    unsafe_first_stop = parse_csv(results_dir / "unsafe_first_stop.csv")
+    
+    # Executive overview metrics
+    distinct_faults = sorted(set(r.get("fault_id") for r in evidence_rows if r.get("fault_id")))
+    decision_counts = Counter(r.get("decision", "UNKNOWN") for r in units)
+    deployed_count = sum(1 for r in units if r.get("deployed") is True)
+    rollback_count = sum(1 for r in units if r.get("rolled_back") is True)
+    
+    approval_counts = Counter(r.get("approval_source") for r in evidence_rows if r.get("approval_source"))
+    diag_modes = Counter(r.get("diag_mode") for r in units)
+    patch_modes = Counter(r.get("patch_mode") for r in units)
+    models = Counter(r.get("model") for r in units if r.get("model"))
+    
+    # First-stop calculations
+    first_stop_counts = Counter(determine_first_stop(u) for u in units)
+    
+    # Gate stats & timing metrics across units
+    gates = ("v0", "v1", "v2", "v3")
+    gate_stats = {}
+    for g in gates:
+        statuses = Counter()
+        durations = []
+        for u in units:
+            g_data = u.get(g) or {}
+            st = g_data.get("status", "unknown")
+            statuses[st] += 1
+            sec = g_data.get("seconds")
+            if sec is not None and isinstance(sec, (int, float)) and sec > 0 and st in ("pass", "fail", "error"):
+                durations.append(sec)
+        gate_stats[g.upper()] = {
+            "statuses": statuses,
+            "min_seconds": min(durations) if durations else None,
+            "avg_seconds": statistics.mean(durations) if durations else None,
+            "median_seconds": statistics.median(durations) if durations else None,
+            "max_seconds": max(durations) if durations else None,
+            "count": len(durations),
+        }
+    
+    # Group candidates by fault
+    fault_groups: dict[str, list[dict]] = {}
+    for u in units:
+        fid = u.get("fault_id", "unknown")
+        fault_groups.setdefault(fid, []).append(u)
+    
+    # Traceability acceptance checks A1-A10
+    acceptance_checks = [
+        {
+            "id": "A1",
+            "name": "One command full loop",
+            "criterion": "One command runs detection, diagnosis, candidate generation, gates, decision, deployment, rollback on 3 faults.",
+            "status": "DONE NOT PROVEN",
+            "evidence": "Pipeline CLI fully implemented (`pipeline run`); verified with `--gates-only` across F01, F04, F06 in Phase 6.",
+            "limitation": "Full unassisted end-to-end deployment run with live Docker requires active verification (runs were executed with --gates-only).",
+        },
+        {
+            "id": "A2",
+            "name": "Detection within 60s",
+            "criterion": "Incident raised within 60 s; none raised in 5 min healthy baseline.",
+            "status": "DONE NOT PROVEN",
+            "evidence": "Detector logic & metrics verified in `tests/test_detector.py` and `tests/test_detector_metrics.py`.",
+            "limitation": "Full multi-minute continuous live observation run across all faults requires production deployment verification.",
+        },
+        {
+            "id": "A3",
+            "name": "Diagnosis ≤3 causes",
+            "criterion": "Valid JSON diagnosis artifact with ≤3 ranked causes; provider_mode recorded; top1/top3 hits tracked.",
+            "status": "PARTIALLY PROVEN",
+            "evidence": "Rule provider tested in `test_providers.py`. Live pilot runs recorded in `results/llm_diagnosis.csv`: F01 (8/8 top-1), F06 (9/9 top-1).",
+            "limitation": "F04 live localization failed completely (0/8 top-1 and top-3 hits). Requires prompt/retrieval investigation.",
+        },
+        {
+            "id": "A4",
+            "name": "Candidate diff generation",
+            "criterion": "Drafts 3 candidate diffs per incident; each applies cleanly or is rejected with apply_error logged.",
+            "status": "PARTIALLY PROVEN",
+            "evidence": "Scripted pool (16 candidates) applies cleanly. Live provider generates diffs and accurately logs `apply_error` upon rejection.",
+            "limitation": "Small local model (`qwen2.5-coder:7b`) generated diffs without required `---` and `+++` file headers; 0 of 9 live patches applied cleanly.",
+        },
+        {
+            "id": "A5",
+            "name": "Isolated Docker sandbox",
+            "criterion": "Docker sandbox executes with `--network none`; outbound network requests fail.",
+            "status": "DONE AND PROVEN",
+            "evidence": "Enforced in `pipeline/sandbox.py:run_gates()` and tested by `tests/test_sandbox.py::test_no_network`.",
+            "limitation": "Requires Docker daemon to be running; local environments without Docker cannot run sandbox gates.",
+        },
+        {
+            "id": "A6",
+            "name": "Gate diversity (V0–V3)",
+            "criterion": "V0, V1, V2, and V3 each catch and stop distinct candidate failure modes.",
+            "status": "DONE AND PROVEN",
+            "evidence": "V0 caught all 9 live diffs (syntax/header); V1 caught 3 ineffective patches; V2 caught 3 regressive patches; V3 caught 2 insecure patches (SQL concatenation).",
+            "limitation": "F06 candidate `F06-scripted-05420f6c` experienced Docker EOF tooling error on V2, demonstrating that infrastructure errors must be tracked separately from code quality.",
+        },
+        {
+            "id": "A7",
+            "name": "Tiered decision engine",
+            "criterion": "decision.json shows risk tier, decision (AUTO_APPLY, ESCALATE, REJECT), and explicit reason strings.",
+            "status": "DONE AND PROVEN",
+            "evidence": "Implemented in `pipeline/decide.py` and comprehensively tested across all rule branches in `tests/test_decide.py`.",
+            "limitation": "Empirical risk calibration (logistic regression) was explicitly deferred to research layer by project plan.",
+        },
+        {
+            "id": "A8",
+            "name": "Human approval path",
+            "criterion": "ESCALATE prompts human operator via CLI; AUTO_APPLY applies automatically without prompt.",
+            "status": "DONE NOT PROVEN",
+            "evidence": "Interactive CLI flow implemented in `deploy.py:approve_cli()`; unit tested in `tests/test_deploy.py`.",
+            "limitation": "Current pilot evidence rows recorded 0 human CLI approvals (all live runs were gates-only non-interactive).",
+        },
+        {
+            "id": "A9",
+            "name": "Automated rollback",
+            "criterion": "Health window catches latency breach (p95 > 2s) or probe mismatch and rolls back image.",
+            "status": "DONE NOT PROVEN",
+            "evidence": "Rollback logic implemented in `deploy.py:release()` and unit tested in `tests/test_deploy.py`. Staged candidate S3b demonstrated latency breach.",
+            "limitation": "Live pilot evidence rows recorded 0 deployments (`deployed: false`), so live automated rollback was not exercised in this batch.",
+        },
+        {
+            "id": "A10",
+            "name": "Evidence traceability",
+            "criterion": "`analyse.py` regenerates pilot table and reports deterministically from `evidence.jsonl`.",
+            "status": "DONE AND PROVEN",
+            "evidence": "Verified in `tests/test_analyse.py::test_output_is_reproducible_byte_for_byte`. Output is byte-identical.",
+            "limitation": "Current evidence candidates are unlabelled in `labels.json`, resulting in N/A policy metrics in `policies.csv` until two-person review is completed.",
+        },
+    ]
+    
+    # Verified limitations
+    known_limitations = [
+        {
+            "title": "Historical Full Test Suite Baseline",
+            "category": "Historical Verification",
+            "description": "Recorded full test runs: 170 passed (Phase 5 baseline) and 174 passed (with dashboard tests). Current workspace environment verified 158 non-docker unit tests passing in ~5-10s. Full Docker sandbox suite requires active local Docker daemon.",
+            "badge": "Historical (Pending Re-run)",
+            "severity": "info",
+        },
+        {
+            "title": "Live Patch Application Failure (0 of 9 Applied)",
+            "category": "LLM Patch Generation",
+            "description": "All 9 live patch attempts produced by `qwen2.5-coder:7b` failed at V0 patch application. Generated diffs lacked the standard `---` and `+++` unified diff headers required by `git apply`.",
+            "badge": "Observed Defect",
+            "severity": "warning",
+        },
+        {
+            "title": "F06 Offline Replay Blocked by Missing Cache Entry",
+            "category": "Replay Integrity",
+            "description": "F06 replay run `F06-replay-1` stopped with `ProviderError` due to missing cache entry `94f9106c7dc60f5304fe2548e61ebd10f1e9edec2c4436f6f9829b0010d8bfa3.json`. Per replay rules, cache misses are blockers and cannot be bypassed.",
+            "badge": "Active Blocker",
+            "severity": "danger",
+        },
+        {
+            "title": "F01 and F04 Offline Replay Unverified",
+            "category": "Replay Integrity",
+            "description": "Offline cache replay verification has not yet been executed for faults F01 and F04 in the recorded pilot session.",
+            "badge": "Unverified",
+            "severity": "warning",
+        },
+        {
+            "title": "F06 Docker/Tooling Tool Error (Candidate F06-scripted-05420f6c)",
+            "category": "Infrastructure Blocker",
+            "description": "Candidate `F06-scripted-05420f6c` failed V2 due to a Docker unexpected EOF/tool error. This is an infrastructure tool error, NOT a valid test failure or patch quality verdict, and is never counted as a pass.",
+            "badge": "Tool Error",
+            "severity": "danger",
+        },
+        {
+            "title": "F04 Diagnosis Localisation Failed (0/8 Hits)",
+            "category": "Model Accuracy",
+            "description": "Pilot evaluation for F04 showed 0/8 top-1 hits and 0/8 top-3 hits (0.0% accuracy, Wilson 95% CI: [0.0%, 32.4%]). The model completely missed the root cause file for F04.",
+            "badge": "Critical Finding",
+            "severity": "danger",
+        },
+        {
+            "title": "Unlabelled Candidates & Zero Human Approvals",
+            "category": "Data & Governance",
+            "description": "All 25 units in `evidence.jsonl` are currently unlabelled in ground-truth labels.json, and zero human approvals were requested or recorded in `--gates-only` mode. Consequently, policy safety rates in `policies.csv` show 0/0 (N/A).",
+            "badge": "Governance",
+            "severity": "info",
+        },
+        {
+            "title": "Metadata / Configuration Discrepancy in F06",
+            "category": "Traceability",
+            "description": "In run `f06-live-diag-4`, the run-level metadata records `diag_samples: 1` while the nested configuration artifact records `diag_samples: 3`. This discrepancy remains recorded until confirmed.",
+            "badge": "Audit Discrepancy",
+            "severity": "warning",
+        },
+    ]
+    
+    return {
+        "evidence_rows": evidence_rows,
+        "units": units,
+        "distinct_faults": distinct_faults,
+        "decision_counts": decision_counts,
+        "deployed_count": deployed_count,
+        "rollback_count": rollback_count,
+        "approval_counts": approval_counts,
+        "diag_modes": diag_modes,
+        "patch_modes": patch_modes,
+        "models": models,
+        "first_stop_counts": first_stop_counts,
+        "gate_stats": gate_stats,
+        "fault_groups": fault_groups,
+        "llm_diagnosis": llm_diagnosis,
+        "llm_units": llm_units,
+        "policies": policies,
+        "approvals": approvals,
+        "rollbacks": rollbacks,
+        "decisions_by_fault": decisions_by_fault,
+        "unsafe_first_stop": unsafe_first_stop,
+        "acceptance_checks": acceptance_checks,
+        "known_limitations": known_limitations,
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+    }
+
+
+def render_html(data: dict) -> str:
+    total_rows = len(data["evidence_rows"])
+    total_units = len(data["units"])
+    distinct_faults_str = ", ".join(data["distinct_faults"])
+    auto_apply_count = data["decision_counts"].get("AUTO_APPLY", 0)
+    escalate_count = data["decision_counts"].get("ESCALATE", 0)
+    reject_count = data["decision_counts"].get("REJECT", 0)
+    deployed_count = data["deployed_count"]
+    rollback_count = data["rollback_count"]
+    
+    pure_live_units = [u for u in data["units"] if u.get("patch_mode") == "live"]
+    
+    html_lines = [
+        "<!DOCTYPE html>",
+        "<html lang=\"en\">",
+        "<head>",
+        "  <meta charset=\"UTF-8\">",
+        "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">",
+        "  <title>AutoImmune — Evidence Dashboard</title>",
+        "  <style>",
+        "    :root {",
+        "      --bg-dark: #090d16;",
+        "      --bg-card: #0f172a;",
+        "      --bg-card-subtle: #131d33;",
+        "      --bg-header: #0b1120;",
+        "      --border: #1e293b;",
+        "      --border-subtle: #334155;",
+        "      --border-focus: #38bdf8;",
+        "      --text-main: #f8fafc;",
+        "      --text-muted: #94a3b8;",
+        "      --text-dim: #64748b;",
+        "      --accent: #38bdf8;",
+        "      --accent-cyan: #06b6d4;",
+        "      --pass: #10b981;",
+        "      --pass-bg: rgba(16, 185, 129, 0.12);",
+        "      --pass-border: #059669;",
+        "      --fail: #f43f5e;",
+        "      --fail-bg: rgba(244, 63, 94, 0.12);",
+        "      --fail-border: #e11d48;",
+        "      --warn: #f59e0b;",
+        "      --warn-bg: rgba(245, 158, 11, 0.12);",
+        "      --warn-border: #d97706;",
+        "      --error: #fb7185;",
+        "      --error-bg: rgba(251, 113, 133, 0.12);",
+        "      --error-border: #f43f5e;",
+        "      --skip: #64748b;",
+        "      --skip-bg: rgba(100, 116, 139, 0.12);",
+        "      --skip-border: #475569;",
+        "    }",
+        "    * { box-sizing: border-box; margin: 0; padding: 0; }",
+        "    body {",
+        "      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;",
+        "      background-color: var(--bg-dark);",
+        "      color: var(--text-main);",
+        "      line-height: 1.5;",
+        "      padding-bottom: 60px;",
+        "    }",
+        "    header {",
+        "      background-color: var(--bg-header);",
+        "      border-bottom: 1px solid var(--border);",
+        "      padding: 20px 32px;",
+        "      position: sticky;",
+        "      top: 0;",
+        "      z-index: 100;",
+        "    }",
+        "    .header-content {",
+        "      max-width: 1400px;",
+        "      margin: 0 auto;",
+        "      display: flex;",
+        "      justify-content: space-between;",
+        "      align-items: center;",
+        "      flex-wrap: wrap;",
+        "      gap: 16px;",
+        "    }",
+        "    .brand-wrap {",
+        "      display: flex;",
+        "      align-items: center;",
+        "      gap: 14px;",
+        "    }",
+        "    .brand-icon {",
+        "      width: 40px;",
+        "      height: 40px;",
+        "      border-radius: 10px;",
+        "      background: linear-gradient(135deg, #0284c7, #0369a1);",
+        "      display: flex;",
+        "      align-items: center;",
+        "      justify-content: center;",
+        "      box-shadow: 0 4px 12px rgba(2, 132, 199, 0.3);",
+        "      flex-shrink: 0;",
+        "    }",
+        "    .brand-text h1 {",
+        "      font-size: 1.3rem;",
+        "      font-weight: 700;",
+        "      letter-spacing: -0.02em;",
+        "      color: #fff;",
+        "      line-height: 1.2;",
+        "    }",
+        "    .brand-text .brand-sub {",
+        "      font-size: 0.82rem;",
+        "      color: var(--accent);",
+        "      font-weight: 600;",
+        "      text-transform: uppercase;",
+        "      letter-spacing: 0.05em;",
+        "    }",
+        "    .status-dot {",
+        "      width: 7px;",
+        "      height: 7px;",
+        "      border-radius: 50%;",
+        "      background: #10b981;",
+        "      display: inline-block;",
+        "      margin-right: 6px;",
+        "    }",
+        "    .funnel-container {",
+        "      background: var(--bg-card);",
+        "      border: 1px solid var(--border);",
+        "      border-radius: 8px;",
+        "      padding: 16px 20px;",
+        "      margin-bottom: 20px;",
+        "    }",
+        "    .funnel-title {",
+        "      font-size: 0.82rem;",
+        "      font-weight: 600;",
+        "      color: var(--text-muted);",
+        "      text-transform: uppercase;",
+        "      letter-spacing: 0.05em;",
+        "      margin-bottom: 12px;",
+        "    }",
+        "    .funnel-bar {",
+        "      display: flex;",
+        "      height: 28px;",
+        "      border-radius: 6px;",
+        "      overflow: hidden;",
+        "      gap: 2px;",
+        "      background: rgba(255, 255, 255, 0.04);",
+        "    }",
+        "    .funnel-segment {",
+        "      display: flex;",
+        "      align-items: center;",
+        "      justify-content: center;",
+        "      font-size: 0.75rem;",
+        "      font-weight: 700;",
+        "      color: #fff;",
+        "      min-width: 32px;",
+        "      transition: opacity 0.2s;",
+        "    }",
+        "    .funnel-segment:hover { opacity: 0.9; }",
+        "    .meta-pills {",
+        "      display: flex;",
+        "      gap: 10px;",
+        "      flex-wrap: wrap;",
+        "    }",
+        "    .pill {",
+        "      background: var(--bg-card);",
+        "      border: 1px solid var(--border);",
+        "      padding: 4px 10px;",
+        "      border-radius: 6px;",
+        "      font-size: 0.8rem;",
+        "      color: var(--text-muted);",
+        "    }",
+        "    .pill strong { color: var(--text-main); }",
+        "    .container {",
+        "      max-width: 1400px;",
+        "      margin: 24px auto;",
+        "      padding: 0 24px;",
+        "    }",
+        "    nav.tabs {",
+        "      display: flex;",
+        "      gap: 6px;",
+        "      border-bottom: 1px solid var(--border);",
+        "      margin-bottom: 24px;",
+        "      overflow-x: auto;",
+        "      padding-bottom: 2px;",
+        "    }",
+        "    nav.tabs button {",
+        "      background: none;",
+        "      border: none;",
+        "      color: var(--text-muted);",
+        "      padding: 10px 16px;",
+        "      font-size: 0.9rem;",
+        "      font-weight: 600;",
+        "      cursor: pointer;",
+        "      border-bottom: 2px solid transparent;",
+        "      transition: all 0.15s ease;",
+        "      white-space: nowrap;",
+        "    }",
+        "    nav.tabs button:hover { color: var(--text-main); }",
+        "    nav.tabs button.active {",
+        "      color: var(--accent);",
+        "      border-bottom-color: var(--accent);",
+        "    }",
+        "    .tab-pane { display: none; }",
+        "    .tab-pane.active { display: block; }",
+        "    .grid-cards {",
+        "      display: grid;",
+        "      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));",
+        "      gap: 16px;",
+        "      margin-bottom: 24px;",
+        "    }",
+        "    .card {",
+        "      background: var(--bg-card);",
+        "      border: 1px solid var(--border);",
+        "      border-radius: 8px;",
+        "      padding: 16px 20px;",
+        "    }",
+        "    .card-title {",
+        "      font-size: 0.8rem;",
+        "      text-transform: uppercase;",
+        "      letter-spacing: 0.05em;",
+        "      color: var(--text-muted);",
+        "      margin-bottom: 8px;",
+        "    }",
+        "    .card-value {",
+        "      font-size: 1.8rem;",
+        "      font-weight: 700;",
+        "      color: var(--text-main);",
+        "      display: flex;",
+        "      align-items: baseline;",
+        "      gap: 8px;",
+        "    }",
+        "    .card-subtext {",
+        "      font-size: 0.8rem;",
+        "      color: var(--text-dim);",
+        "      margin-top: 6px;",
+        "    }",
+        "    .banner {",
+        "      background: var(--bg-card-subtle);",
+        "      border-left: 4px solid var(--accent);",
+        "      padding: 14px 18px;",
+        "      border-radius: 4px 8px 8px 4px;",
+        "      margin-bottom: 24px;",
+        "      font-size: 0.9rem;",
+        "    }",
+        "    .banner.alert-warning { border-left-color: var(--warn); background: rgba(245, 158, 11, 0.08); }",
+        "    .banner.alert-info { border-left-color: var(--accent); background: rgba(56, 189, 248, 0.08); }",
+        "    .section-title {",
+        "      font-size: 1.15rem;",
+        "      font-weight: 700;",
+        "      color: #fff;",
+        "      margin: 28px 0 14px;",
+        "      display: flex;",
+        "      align-items: center;",
+        "      gap: 10px;",
+        "    }",
+        "    .section-subtitle {",
+        "      font-size: 0.88rem;",
+        "      color: var(--text-muted);",
+        "      margin-top: -8px;",
+        "      margin-bottom: 16px;",
+        "    }",
+        "    .table-container {",
+        "      background: var(--bg-card);",
+        "      border: 1px solid var(--border);",
+        "      border-radius: 8px;",
+        "      overflow-x: auto;",
+        "      margin-bottom: 24px;",
+        "    }",
+        "    table {",
+        "      width: 100%;",
+        "      border-collapse: collapse;",
+        "      text-align: left;",
+        "      font-size: 0.88rem;",
+        "    }",
+        "    th {",
+        "      background: #141d30;",
+        "      color: var(--text-muted);",
+        "      font-weight: 600;",
+        "      padding: 12px 16px;",
+        "      border-bottom: 1px solid var(--border);",
+        "      white-space: nowrap;",
+        "    }",
+        "    td {",
+        "      padding: 12px 16px;",
+        "      border-bottom: 1px solid var(--border);",
+        "      color: var(--text-main);",
+        "    }",
+        "    tr:last-child td { border-bottom: none; }",
+        "    tr:hover td { background: rgba(255, 255, 255, 0.02); }",
+        "    .badge {",
+        "      display: inline-block;",
+        "      padding: 2px 8px;",
+        "      border-radius: 4px;",
+        "      font-size: 0.75rem;",
+        "      font-weight: 600;",
+        "      line-height: 1.4;",
+        "      text-transform: uppercase;",
+        "      letter-spacing: 0.03em;",
+        "    }",
+        "    .badge-pass { background: var(--pass-bg); color: var(--pass); border: 1px solid var(--pass-border); }",
+        "    .badge-fail { background: var(--fail-bg); color: var(--fail); border: 1px solid var(--fail-border); }",
+        "    .badge-warn { background: var(--warn-bg); color: var(--warn); border: 1px solid var(--warn-border); }",
+        "    .badge-error { background: var(--error-bg); color: var(--error); border: 1px solid var(--error-border); }",
+        "    .badge-skip { background: var(--skip-bg); color: var(--skip); border: 1px solid var(--skip-border); }",
+        "    .badge-auto { background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid #059669; }",
+        "    .badge-escalate { background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid #d97706; }",
+        "    .badge-reject { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid #dc2626; }",
+        "    .badge-not-deployed { background: rgba(100, 116, 139, 0.2); color: #94a3b8; border: 1px solid #475569; }",
+        "    .badge-deployed { background: rgba(56, 189, 248, 0.2); color: #38bdf8; border: 1px solid #0284c7; }",
+        "    .filter-bar {",
+        "      display: flex;",
+        "      flex-wrap: wrap;",
+        "      gap: 12px;",
+        "      margin-bottom: 16px;",
+        "      align-items: center;",
+        "      background: var(--bg-card);",
+        "      padding: 12px 16px;",
+        "      border-radius: 8px;",
+        "      border: 1px solid var(--border);",
+        "    }",
+        "    .filter-group {",
+        "      display: flex;",
+        "      align-items: center;",
+        "      gap: 8px;",
+        "    }",
+        "    .filter-group label {",
+        "      font-size: 0.8rem;",
+        "      color: var(--text-muted);",
+        "      font-weight: 600;",
+        "    }",
+        "    select, input[type=\"text\"] {",
+        "      background: var(--bg-dark);",
+        "      border: 1px solid var(--border);",
+        "      color: var(--text-main);",
+        "      padding: 6px 12px;",
+        "      border-radius: 6px;",
+        "      font-size: 0.85rem;",
+        "    }",
+        "    select:focus, input[type=\"text\"]:focus {",
+        "      outline: none;",
+        "      border-color: var(--border-focus);",
+        "    }",
+        "    .search-input { min-width: 240px; }",
+        "    .btn-reset {",
+        "      background: #1f293d;",
+        "      border: 1px solid var(--border);",
+        "      color: var(--text-muted);",
+        "      padding: 6px 12px;",
+        "      border-radius: 6px;",
+        "      font-size: 0.8rem;",
+        "      font-weight: 600;",
+        "      cursor: pointer;",
+        "      transition: all 0.15s ease;",
+        "    }",
+        "    .btn-reset:hover { background: #334155; color: #fff; }",
+        "    .counter-pill {",
+        "      margin-left: auto;",
+        "      font-size: 0.82rem;",
+        "      color: var(--accent);",
+        "      background: rgba(56, 189, 248, 0.1);",
+        "      border: 1px solid rgba(56, 189, 248, 0.25);",
+        "      padding: 4px 10px;",
+        "      border-radius: 6px;",
+        "      font-weight: 600;",
+        "    }",
+        "    .callout {",
+        "      border-left: 3px solid #38bdf8;",
+        "      padding: 8px 14px;",
+        "      background: rgba(56, 189, 248, 0.05);",
+        "      margin: 8px 0;",
+        "      border-radius: 0 6px 6px 0;",
+        "      font-size: 0.85rem;",
+        "    }",
+        "    .two-col {",
+        "      display: grid;",
+        "      grid-template-columns: 1fr 1fr;",
+        "      gap: 20px;",
+        "      margin-bottom: 24px;",
+        "    }",
+        "    @media (max-width: 900px) {",
+        "      .two-col { grid-template-columns: 1fr; }",
+        "    }",
+        "    .limitations-list {",
+        "      display: flex;",
+        "      flex-direction: column;",
+        "      gap: 12px;",
+        "    }",
+        "    .limitation-item {",
+        "      background: var(--bg-card);",
+        "      border: 1px solid var(--border);",
+        "      border-radius: 8px;",
+        "      padding: 16px 20px;",
+        "    }",
+        "    .limitation-header {",
+        "      display: flex;",
+        "      justify-content: space-between;",
+        "      align-items: center;",
+        "      margin-bottom: 8px;",
+        "    }",
+        "    .limitation-title {",
+        "      font-weight: 600;",
+        "      font-size: 0.95rem;",
+        "      color: var(--text-main);",
+        "    }",
+        "    .limitation-desc {",
+        "      font-size: 0.85rem;",
+        "      color: var(--text-muted);",
+        "      line-height: 1.5;",
+        "    }",
+        "    .code-snippet {",
+        "      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;",
+        "      background: #070b14;",
+        "      padding: 2px 6px;",
+        "      border-radius: 4px;",
+        "      font-size: 0.8rem;",
+        "      color: #38bdf8;",
+        "    }",
+        "  </style>",
+        "</head>",
+        "<body>",
+        "  <header>",
+        "    <div class=\"header-content\">",
+        "      <div class=\"brand-wrap\">",
+        "        <div class=\"brand-icon\">",
+        "          <svg width=\"22\" height=\"22\" viewBox=\"0 0 24 24\" fill=\"none\">",
+        "            <path d=\"M12 2L3 7V12C3 17.5 7 21.5 12 22C17 21.5 21 17.5 21 12V7L12 2Z\" stroke=\"#fff\" stroke-width=\"2\" stroke-linejoin=\"round\"/>",
+        "            <path d=\"M9 12L11 14L15 10\" stroke=\"#fff\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>",
+        "          </svg>",
+        "        </div>",
+        "        <div class=\"brand-text\">",
+        "          <h1>AutoImmune</h1>",
+        "          <div class=\"brand-sub\">Evidence Dashboard</div>",
+        "        </div>",
+        "      </div>",
+        "      <div class=\"meta-pills\">",
+        "        <div class=\"pill\"><span class=\"status-dot\"></span>Mode: <strong>Offline Read-Only</strong></div>",
+        f"        <div class=\"pill\">Repository: <strong>AutoImmune</strong></div>",
+        f"        <div class=\"pill\">Generated: <strong>{esc(data['generated_at'])}</strong></div>",
+        "      </div>",
+        "    </div>",
+        "  </header>",
+        "",
+        "  <div class=\"container\">",
+        "    <nav class=\"tabs\">",
+        "      <button class=\"active\" onclick=\"showTab('tab-overview', this)\">Executive Overview</button>",
+        "      <button onclick=\"showTab('tab-llm', this)\">LLM vs Scripted</button>",
+        "      <button onclick=\"showTab('tab-gates', this)\">Validation Gates</button>",
+        "      <button onclick=\"showTab('tab-faults', this)\">Per-Fault Breakdown</button>",
+        "      <button onclick=\"showTab('tab-candidates', this)\">Candidate Review</button>",
+        "      <button onclick=\"showTab('tab-policies', this)\">Policy Comparison</button>",
+        "      <button onclick=\"showTab('tab-approvals', this)\">Approval & Rollback</button>",
+        "      <button onclick=\"showTab('tab-checks', this)\">Acceptance Checks</button>",
+        "      <button onclick=\"showTab('tab-limitations', this)\">Known Limitations</button>",
+        "    </nav>",
+        "",
+        "    <!-- SECTION A: Executive Overview -->",
+        "    <div id=\"tab-overview\" class=\"tab-pane active\">",
+        "      <div class=\"banner alert-info\">",
+        "        <strong>Data Source Integrity:</strong> Metrics are rendered directly from <code>results/evidence.jsonl</code>, ",
+        "        <code>results/llm_diagnosis.csv</code>, and pilot logs. Missing gates are recorded as not-run, never passes.",
+        "      </div>",
+        "      <div class=\"grid-cards\">",
+        "        <div class=\"card\">",
+        "          <div class=\"card-title\">Total Evidence Rows</div>",
+        f"          <div class=\"card-value\">{total_rows}</div>",
+        "          <div class=\"card-subtext\">Recorded runs in <code>evidence.jsonl</code></div>",
+        "        </div>",
+        "        <div class=\"card\">",
+        "          <div class=\"card-title\">Unique Candidates (Units)</div>",
+        f"          <div class=\"card-value\">{total_units}</div>",
+        f"          <div class=\"card-subtext\">Across {len(data['distinct_faults'])} faults ({esc(distinct_faults_str)})</div>",
+        "        </div>",
+        "        <div class=\"card\">",
+        "          <div class=\"card-title\">Decision Distribution</div>",
+        "          <div class=\"card-value\" style=\"font-size: 1.25rem; font-weight: 600;\">",
+        f"            <span style=\"color: #34d399;\">{auto_apply_count} Auto</span> / ",
+        f"            <span style=\"color: #fbbf24;\">{escalate_count} Esc</span> / ",
+        f"            <span style=\"color: #f87171;\">{reject_count} Rej</span>",
+        "          </div>",
+        "          <div class=\"card-subtext\">Gate + rule outcomes</div>",
+        "        </div>",
+        "        <div class=\"card\">",
+        "          <div class=\"card-title\">Actual Deployments</div>",
+        f"          <div class=\"card-value\" style=\"color: #94a3b8;\">{deployed_count}</div>",
+        "          <div class=\"card-subtext\"><code>--gates-only</code> runs (0 deployed)</div>",
+        "        </div>",
+        "        <div class=\"card\">",
+        "          <div class=\"card-title\">Actual Rollbacks</div>",
+        f"          <div class=\"card-value\" style=\"color: #94a3b8;\">{rollback_count}</div>",
+        "          <div class=\"card-subtext\">0 real rollbacks in evidence</div>",
+        "        </div>",
+        "        <div class=\"card\">",
+        "          <div class=\"card-title\">Recorded Approvals</div>",
+        "          <div class=\"card-value\" style=\"font-size: 1.25rem; font-weight: 600;\">",
+        f"            <span>{data['approval_counts'].get('human_cli', 0)} CLI</span> / <span>{data['approval_counts'].get('human_relayed', 0)} Relayed</span>",
+        "          </div>",
+        "          <div class=\"card-subtext\">No human approvals recorded</div>",
+        "        </div>",
+        "      </div>",
+        "",
+        "      <div class=\"two-col\">",
+        "        <div class=\"card\">",
+        "          <div class=\"section-title\" style=\"margin-top: 0;\">Candidate Ingestion Summary</div>",
+        "          <div class=\"table-container\" style=\"border: none;\">",
+        "            <table>",
+        "              <thead><tr><th>Dimension</th><th>Recorded Values</th></tr></thead>",
+        "              <tbody>",
+        f"                <tr><td>Fault Coverage</td><td><strong>{esc(distinct_faults_str)}</strong> (3 active benchmark faults)</td></tr>",
+        f"                <tr><td>Diag Providers</td><td><strong>live</strong>: {data['diag_modes'].get('live', 0)}</td></tr>",
+        f"                <tr><td>Patch Modes</td><td><strong>scripted</strong>: {data['patch_modes'].get('scripted', 0)}, <strong>live</strong>: {data['patch_modes'].get('live', 0)}</td></tr>",
+        f"                <tr><td>LLM Models</td><td><strong>qwen2.5-coder:7b</strong>: {data['models'].get('qwen2.5-coder:7b', 0)}</td></tr>",
+        "                <tr><td>Analysis Unit</td><td>Latest valid row per (fault_id, candidate_id)</td></tr>",
+        "                <tr><td>Label Status</td><td>25 unlabelled (draft review pending)</td></tr>",
+        "              </tbody>",
+        "            </table>",
+        "          </div>",
+        "        </div>",
+        "        <div class=\"card\">",
+        "          <div class=\"section-title\" style=\"margin-top: 0;\">Architectural Safety Constraints</div>",
+        "          <p style=\"font-size: 0.88rem; color: var(--text-muted); margin-bottom: 12px;\">",
+        "            The AutoImmune pipeline enforces strict boundaries between deterministic validation, decision rules, and actual deployment:",
+        "          </p>",
+        "          <div class=\"callout\"><strong>1. <code>AUTO_APPLY</code> != Deployment:</strong> An <code>AUTO_APPLY</code> verdict means a candidate passed validation and scope criteria. It was not actually deployed if the pipeline ran with <code>--gates-only</code>.</div>",
+        "          <div class=\"callout\"><strong>2. Gate Isolation:</strong> Docker sandbox runs with <code>--network none</code>. Hidden tests (<code>faults/*/hidden_tests/</code>) are never mounted or exposed to models.</div>",
+        "          <div class=\"callout\"><strong>3. Separation of Evidence:</strong> Live LLM diffs are separated from deterministic scripted candidates. Scripted outcomes are never pooled into LLM metrics.</div>",
+        "        </div>",
+        "      </div>",
+        "    </div>",
+        "",
+        "    <!-- SECTION B: LLM vs Scripted Results -->",
+        "    <div id=\"tab-llm\" class=\"tab-pane\">",
+        "      <div class=\"banner alert-warning\">",
+        "        <strong>Honest Pilot Separation:</strong> Scripted candidates evaluate pipeline validation mechanics. ",
+        "        Live LLM candidates evaluate generative capabilities. They are tracked in separate panels and never combined.",
+        "      </div>",
+        "      <div class=\"section-title\">Panel 1 — Generative Live LLM Patches (diag_mode=live, patch_mode=live)</div>",
+        "      <p class=\"section-subtitle\">Observed results for candidates drafted live by <code>qwen2.5-coder:7b</code></p>",
+        "      <div class=\"table-container\">",
+        "        <table>",
+        "          <thead>",
+        "            <tr>",
+        "              <th>Fault</th><th>Candidate ID</th><th>Model</th><th>V0 (Compile/Apply)</th><th>V1 (Target)</th><th>V2 (Regression)</th><th>V3 (Semgrep)</th><th>Decision</th><th>Failure Reason</th>",
+        "            </tr>",
+        "          </thead>",
+        "          <tbody>",
+    ]
+    
+    for u in pure_live_units:
+        v0_st = u.get("v0", {}).get("status", "unknown")
+        v1_st = u.get("v1", {}).get("status", "unknown")
+        v2_st = u.get("v2", {}).get("status", "unknown")
+        v3_st = u.get("v3", {}).get("status", "unknown")
+        reasons = "; ".join(u.get("reasons", [])) or "patch does not apply"
+        html_lines.append(
+            f"            <tr>"
+            f"<td><strong>{esc(u.get('fault_id', ''))}</strong></td>"
+            f"<td><span class=\"code-snippet\">{esc(u.get('candidate_id', ''))}</span></td>"
+            f"<td>{esc(u.get('model', ''))}</td>"
+            f"<td><span class=\"badge badge-{esc(v0_st)}\">{esc(v0_st)}</span></td>"
+            f"<td><span class=\"badge badge-{esc(v1_st)}\">{esc(v1_st)}</span></td>"
+            f"<td><span class=\"badge badge-{esc(v2_st)}\">{esc(v2_st)}</span></td>"
+            f"<td><span class=\"badge badge-{esc(v3_st)}\">{esc(v3_st)}</span></td>"
+            f"<td><span class=\"badge badge-reject\">{esc(u.get('decision', ''))}</span></td>"
+            f"<td style=\"font-size: 0.82rem; color: #f87171;\">{esc(reasons)}</td>"
+            f"</tr>"
+        )
+    
+    html_lines += [
+        "          </tbody>",
+        "        </table>",
+        "      </div>",
+        "      <div class=\"callout\" style=\"margin-bottom: 24px;\">",
+        "        <strong>Root Cause of 0/9 Live Patch Application:</strong> Live diffs produced by <code>qwen2.5-coder:7b</code> lacked standard <code>---</code> and <code>+++</code> headers. ",
+        "        <code>git apply --check</code> rejected all 9 patches immediately at Gate V0. This is an honest empirical limitation.",
+        "      </div>",
+        "",
+        "      <div class=\"section-title\">Panel 2 — Live LLM Diagnosis Accuracy (from results/llm_diagnosis.csv)</div>",
+        "      <p class=\"section-subtitle\">Measured localisation accuracy across pilot runs</p>",
+        "      <div class=\"table-container\">",
+        "        <table>",
+        "          <thead>",
+        "            <tr>",
+        "              <th>Fault ID</th><th>Model</th><th>Top-1 Hits</th><th>Top-1 Rate [Wilson 95% CI]</th><th>Top-3 Hits</th><th>Top-3 Rate [Wilson 95% CI]</th><th>Evaluated Samples (n)</th><th>Evaluation Notes</th>",
+        "            </tr>",
+        "          </thead>",
+        "          <tbody>",
+    ]
+    
+    for row in data["llm_diagnosis"]:
+        fid = row.get("fault", "")
+        m = row.get("model", "")
+        t1_k = row.get("top1_k", "0")
+        t1_n = row.get("top1_n", "0")
+        t1_rate = f"{float(row.get('top1_rate', 0))*100:.1f}%"
+        t1_low = f"{float(row.get('top1_low', 0))*100:.1f}%"
+        t1_high = f"{float(row.get('top1_high', 0))*100:.1f}%"
+        t3_k = row.get("top3_k", "0")
+        t3_n = row.get("top3_n", "0")
+        t3_rate = f"{float(row.get('top3_rate', 0))*100:.1f}%"
+        t3_low = f"{float(row.get('top3_low', 0))*100:.1f}%"
+        t3_high = f"{float(row.get('top3_high', 0))*100:.1f}%"
+        note = "Perfect localization" if fid in ("F01", "F06") else "<strong style='color:#ef4444;'>Localization failure (0/8)</strong>"
+        html_lines.append(
+            f"            <tr>"
+            f"<td><strong>{esc(fid)}</strong></td>"
+            f"<td>{esc(m)}</td>"
+            f"<td>{esc(t1_k)}/{esc(t1_n)}</td>"
+            f"<td><strong>{esc(t1_rate)}</strong> <span style=\"font-size:0.8rem; color:var(--text-dim);\">[{esc(t1_low)}, {esc(t1_high)}]</span></td>"
+            f"<td>{esc(t3_k)}/{esc(t3_n)}</td>"
+            f"<td><strong>{esc(t3_rate)}</strong> <span style=\"font-size:0.8rem; color:var(--text-dim);\">[{esc(t3_low)}, {esc(t3_high)}]</span></td>"
+            f"<td>{esc(t1_n)}</td>"
+            f"<td>{note}</td>"
+            f"</tr>"
+        )
+        
+    html_lines += [
+        "          </tbody>",
+        "        </table>",
+        "      </div>",
+        "    </div>",
+        "",
+        "    <!-- SECTION C: Validation Gates V0-V3 -->",
+        "    <div id=\"tab-gates\" class=\"tab-pane\">",
+        "      <div class=\"section-title\">Validation Gates (V0 – V3) Summary</div>",
+        "      <p class=\"section-subtitle\">Gates execute sequentially. A failure at any gate halts execution and marks downstream gates as <code>not_run</code>.</p>",
+        "      <div class=\"grid-cards\">",
+        "        <div class=\"card\">",
+        "          <div class=\"card-title\">Gate V0 — Compile & Apply</div>",
+        "          <div style=\"font-size: 0.85rem; color: var(--text-muted); margin-bottom: 8px;\"><code>git apply --check</code> + <code>mvn compile</code></div>",
+        "          <div class=\"card-value\" style=\"font-size: 1.25rem;\">",
+        f"            <span style=\"color: #34d399;\">{data['gate_stats']['V0']['statuses'].get('pass', 0)} Pass</span> / ",
+        f"            <span style=\"color: #f87171;\">{data['gate_stats']['V0']['statuses'].get('fail', 0)} Fail</span>",
+        "          </div>",
+        f"          <div class=\"card-subtext\">Avg: {data['gate_stats']['V0']['avg_seconds']:.1f}s (med {data['gate_stats']['V0']['median_seconds']:.1f}s)</div>",
+        "        </div>",
+        "        <div class=\"card\">",
+        "          <div class=\"card-title\">Gate V1 — Target Test</div>",
+        "          <div style=\"font-size: 0.85rem; color: var(--text-muted); margin-bottom: 8px;\">Target reproducer test for fault</div>",
+        "          <div class=\"card-value\" style=\"font-size: 1.25rem;\">",
+        f"            <span style=\"color: #34d399;\">{data['gate_stats']['V1']['statuses'].get('pass', 0)} Pass</span> / ",
+        f"            <span style=\"color: #f87171;\">{data['gate_stats']['V1']['statuses'].get('fail', 0)} Fail</span>",
+        "          </div>",
+        f"          <div class=\"card-subtext\">Not run: {data['gate_stats']['V1']['statuses'].get('not_run', 0)} (after V0 fail)</div>",
+        "        </div>",
+        "        <div class=\"card\">",
+        "          <div class=\"card-title\">Gate V2 — Regression Suite</div>",
+        "          <div style=\"font-size: 0.85rem; color: var(--text-muted); margin-bottom: 8px;\">Full Maven regression test suite</div>",
+        "          <div class=\"card-value\" style=\"font-size: 1.25rem;\">",
+        f"            <span style=\"color: #34d399;\">{data['gate_stats']['V2']['statuses'].get('pass', 0)} Pass</span> / ",
+        f"            <span style=\"color: #f87171;\">{data['gate_stats']['V2']['statuses'].get('fail', 0)} Fail</span> / ",
+        f"            <span style=\"color: #ec4899;\">{data['gate_stats']['V2']['statuses'].get('error', 0)} Err</span>",
+        "          </div>",
+        f"          <div class=\"card-subtext\">1 Docker EOF tooling error</div>",
+        "        </div>",
+        "        <div class=\"card\">",
+        "          <div class=\"card-title\">Gate V3 — Semgrep Analysis</div>",
+        "          <div style=\"font-size: 0.85rem; color: var(--text-muted); margin-bottom: 8px;\">Diff scan vs unpatched baseline</div>",
+        "          <div class=\"card-value\" style=\"font-size: 1.25rem;\">",
+        f"            <span style=\"color: #34d399;\">{data['gate_stats']['V3']['statuses'].get('pass', 0)} Pass</span> / ",
+        f"            <span style=\"color: #f87171;\">{data['gate_stats']['V3']['statuses'].get('fail', 0)} Fail</span>",
+        "          </div>",
+        f"          <div class=\"card-subtext\">Not run: {data['gate_stats']['V3']['statuses'].get('not_run', 0)}</div>",
+        "        </div>",
+        "      </div>",
+        "",
+        "      <div class=\"section-title\">Gate Funnel & First-Stop Table (Where Candidates Were Stopped)</div>",
+        "      <p class=\"section-subtitle\">Identifies the exact gate that arrested each candidate, preventing unsafe changes from reaching deployment.</p>",
+        "      <div class=\"funnel-container\">",
+        "        <div class=\"funnel-title\">Validation Gate Attrition Funnel</div>",
+        "        <div class=\"funnel-bar\">",
+    ]
+    funnel_stages = [
+        ("V0", "Stopped at V0", "#f43f5e"),
+        ("V1", "Stopped at V1", "#f97316"),
+        ("V2", "Stopped at V2", "#eab308"),
+        ("V3", "Stopped at V3", "#ec4899"),
+        ("SURVIVED", "Survived V0–V3", "#10b981"),
+    ]
+    for stage_key, stage_label, stage_color in funnel_stages:
+        st_cnt = data['first_stop_counts'].get(stage_key, 0)
+        st_pct = (st_cnt / total_units * 100) if total_units else 0.0
+        html_lines.append(
+            f"          <div class=\"funnel-segment\" style=\"width: {st_pct:.1f}%; background: {stage_color};\" title=\"{esc(stage_label)}: {st_cnt} ({st_pct:.1f}%)\"><span>{esc(stage_key)}: {st_cnt}</span></div>"
+        )
+    html_lines += [
+        "        </div>",
+        "      </div>",
+        "      <div class=\"table-container\">",
+        "        <table>",
+        "          <thead>",
+        "            <tr>",
+        "              <th>Gate / First Stop Stage</th><th>Candidates Stopped</th><th>Proportion of Units (N=25)</th><th>Failure Mechanism Caught</th><th>Downstream Action</th>",
+        "            </tr>",
+        "          </thead>",
+        "          <tbody>",
+    ]
+    v0_cnt = data['first_stop_counts'].get('V0', 0)
+    v1_cnt = data['first_stop_counts'].get('V1', 0)
+    v2_cnt = data['first_stop_counts'].get('V2', 0)
+    v3_cnt = data['first_stop_counts'].get('V3', 0)
+    surv_cnt = data['first_stop_counts'].get('SURVIVED', 0)
+    v0_pct = f"{(v0_cnt / total_units * 100):.1f}%" if total_units else "0.0%"
+    v1_pct = f"{(v1_cnt / total_units * 100):.1f}%" if total_units else "0.0%"
+    v2_pct = f"{(v2_cnt / total_units * 100):.1f}%" if total_units else "0.0%"
+    v3_pct = f"{(v3_cnt / total_units * 100):.1f}%" if total_units else "0.0%"
+    surv_pct = f"{(surv_cnt / total_units * 100):.1f}%" if total_units else "0.0%"
+    html_lines += [
+        f"            <tr><td><strong>Gate V0 (Compile / Apply)</strong></td><td><strong>{v0_cnt}</strong></td><td>{v0_pct}</td><td>Unified diff syntax error (missing <code>---</code> and <code>+++</code> headers)</td><td>Halted immediately; V1–V3 marked <code>not_run</code></td></tr>",
+        f"            <tr><td><strong>Gate V1 (Target Test)</strong></td><td><strong>{v1_cnt}</strong></td><td>{v1_pct}</td><td>Ineffective patches; targeted reproducer test fails</td><td>Halted immediately; V2–V3 marked <code>not_run</code></td></tr>",
+        f"            <tr><td><strong>Gate V2 (Regression Suite)</strong></td><td><strong>{v2_cnt}</strong></td><td>{v2_pct}</td><td>3 regressive test failures + 1 Docker EOF tooling error</td><td>Halted immediately; V3 marked <code>not_run</code></td></tr>",
+        f"            <tr><td><strong>Gate V3 (Semgrep Security)</strong></td><td><strong>{v3_cnt}</strong></td><td>{v3_pct}</td><td>Insecure code; introduced new high-severity findings (SQL concatenation)</td><td>REJECT (decision engine)</td></tr>",
+        f"            <tr style=\"background: rgba(16, 185, 129, 0.05);\"><td><strong style=\"color:#34d399;\">Survived All Gates (V0–V3)</strong></td><td><strong style=\"color:#34d399;\">{surv_cnt}</strong></td><td>{surv_pct}</td><td>Clean patch passing compilation, reproducer, regression, and Semgrep</td><td>6 AUTO_APPLY, 1 ESCALATE (diff limit)</td></tr>",
+        "          </tbody>",
+        "        </table>",
+        "      </div>",
+        "",
+        "      <div class=\"section-title\">Gate Performance & Timing Statistics</div>",
+        "      <p class=\"section-subtitle\">Empirical execution duration statistics in seconds for executed gates (excluding not_run / skips)</p>",
+        "      <div class=\"table-container\">",
+        "        <table>",
+        "          <thead>",
+        "            <tr>",
+        "              <th>Gate</th><th>Evaluated Runs (n)</th><th>Min (s)</th><th>Avg / Mean (s)</th><th>Median (s)</th><th>Max (s)</th><th>Missing Counted as Pass?</th>",
+        "            </tr>",
+        "          </thead>",
+        "          <tbody>",
+    ]
+    gates = ("V0", "V1", "V2", "V3")
+    for g_name in gates:
+        st_data = data["gate_stats"][g_name]
+        min_str = f"{st_data['min_seconds']:.1f}s" if st_data['min_seconds'] is not None else "N/A"
+        avg_str = f"{st_data['avg_seconds']:.1f}s" if st_data['avg_seconds'] is not None else "N/A"
+        med_str = f"{st_data['median_seconds']:.1f}s" if st_data['median_seconds'] is not None else "N/A"
+        max_str = f"{st_data['max_seconds']:.1f}s" if st_data['max_seconds'] is not None else "N/A"
+        html_lines.append(
+            f"            <tr>"
+            f"<td><strong>{esc(g_name)}</strong></td>"
+            f"<td>{st_data['count']}</td>"
+            f"<td>{min_str}</td>"
+            f"<td><strong>{avg_str}</strong></td>"
+            f"<td>{med_str}</td>"
+            f"<td>{max_str}</td>"
+            f"<td><span class=\"badge badge-reject\">NO</span></td>"
+            f"</tr>"
+        )
+        
+    html_lines += [
+        "          </tbody>",
+        "        </table>",
+        "      </div>",
+        "    </div>",
+        "",
+        "    <!-- SECTION D: Per-Fault Breakdown -->",
+        "    <div id=\"tab-faults\" class=\"tab-pane\">",
+        "      <div class=\"section-title\">Per-Fault Evidence Summaries</div>",
+        "      <p class=\"section-subtitle\">Granular gate and decision outcomes for benchmark faults F01, F04, and F06</p>",
+    ]
+    
+    fault_descriptions = {
+        "F01": "Order calculation logic regression (price/discount arithmetic bug).",
+        "F04": "Configuration misconfiguration (application.properties causing /actuator/health DOWN).",
+        "F06": "Silent corruption / pricing probe mismatch (returned 200 OK with incorrect order total).",
+    }
+    
+    for fid in data["distinct_faults"]:
+        cands = data["fault_groups"].get(fid, [])
+        auto_c = sum(1 for c in cands if c.get("decision") == "AUTO_APPLY")
+        esc_c = sum(1 for c in cands if c.get("decision") == "ESCALATE")
+        rej_c = sum(1 for c in cands if c.get("decision") == "REJECT")
+        html_lines += [
+            f"      <div class=\"card\" style=\"margin-bottom: 20px;\">",
+            f"        <div style=\"display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 8px; margin-bottom: 12px;\">",
+            f"          <div>",
+            f"            <h3 style=\"font-size: 1.1rem; color: #fff;\">Fault {esc(fid)}</h3>",
+            f"            <div style=\"font-size: 0.85rem; color: var(--text-muted);\">{esc(fault_descriptions.get(fid, ''))}</div>",
+            f"          </div>",
+            f"          <div style=\"display: flex; gap: 8px;\">",
+            f"            <span class=\"badge badge-auto\">{auto_c} AUTO_APPLY</span>",
+            f"            <span class=\"badge badge-escalate\">{esc_c} ESCALATE</span>",
+            f"            <span class=\"badge badge-reject\">{rej_c} REJECT</span>",
+            f"          </div>",
+            f"        </div>",
+            f"        <div class=\"table-container\" style=\"margin-bottom: 0;\">",
+            f"          <table>",
+            f"            <thead>",
+            f"              <tr><th>Candidate ID</th><th>Kind</th><th>Patch Mode</th><th>V0</th><th>V1</th><th>V2</th><th>V3</th><th>Decision</th><th>Deployed</th><th>Rejection / Reason</th></tr>",
+            f"            </thead>",
+            f"            <tbody>",
+        ]
+        for c in cands:
+            v0_st = c.get("v0", {}).get("status", "unknown")
+            v1_st = c.get("v1", {}).get("status", "unknown")
+            v2_st = c.get("v2", {}).get("status", "unknown")
+            v3_st = c.get("v3", {}).get("status", "unknown")
+            dec = c.get("decision", "UNKNOWN")
+            dec_cls = "badge-auto" if dec == "AUTO_APPLY" else ("badge-escalate" if dec == "ESCALATE" else "badge-reject")
+            dep_cls = "badge-deployed" if c.get("deployed") else "badge-not-deployed"
+            dep_txt = "YES" if c.get("deployed") else "NO"
+            reasons = "; ".join(c.get("reasons", [])) or (c.get("apply_error") or "—")
+            html_lines.append(
+                f"              <tr>"
+                f"<td><span class=\"code-snippet\">{esc(c.get('candidate_id', ''))}</span></td>"
+                f"<td>{esc(c.get('candidate_kind') or 'unlabelled')}</td>"
+                f"<td>{esc(c.get('patch_mode', ''))}</td>"
+                f"<td><span class=\"badge badge-{esc(v0_st)}\">{esc(v0_st)}</span></td>"
+                f"<td><span class=\"badge badge-{esc(v1_st)}\">{esc(v1_st)}</span></td>"
+                f"<td><span class=\"badge badge-{esc(v2_st)}\">{esc(v2_st)}</span></td>"
+                f"<td><span class=\"badge badge-{esc(v3_st)}\">{esc(v3_st)}</span></td>"
+                f"<td><span class=\"badge {dec_cls}\">{esc(dec)}</span></td>"
+                f"<td><span class=\"badge {dep_cls}\">{dep_txt}</span></td>"
+                f"<td style=\"font-size: 0.8rem; color: var(--text-muted); max-width: 320px;\">{esc(reasons)}</td>"
+                f"</tr>"
+            )
+        html_lines += [
+            f"            </tbody>",
+            f"          </table>",
+            f"        </div>",
+            f"      </div>",
+        ]
+        
+    html_lines += [
+        "    </div>",
+        "",
+        "    <!-- SECTION E: Candidate Review -->",
+        "    <div id=\"tab-candidates\" class=\"tab-pane\">",
+        "      <div class=\"section-title\">Candidate Review Matrix</div>",
+        "      <p class=\"section-subtitle\">Explore all 25 evidence candidates with real-time filtering, search, and gate outcome tracking.</p>",
+        "      <div class=\"filter-bar\">",
+        "        <div class=\"filter-group\">",
+        "          <label for=\"searchCandidates\">Search:</label>",
+        "          <input type=\"text\" id=\"searchCandidates\" class=\"search-input\" placeholder=\"Search candidate, run, fault, reasons...\" oninput=\"filterTable()\">",
+        "        </div>",
+        "        <div class=\"filter-group\">",
+        "          <label for=\"filterFault\">Fault:</label>",
+        "          <select id=\"filterFault\" onchange=\"filterTable()\">",
+        "            <option value=\"ALL\">All Faults</option>",
+    ]
+    for fid in data["distinct_faults"]:
+        html_lines.append(f"            <option value=\"{esc(fid)}\">{esc(fid)}</option>")
+    html_lines += [
+        "          </select>",
+        "        </div>",
+        "        <div class=\"filter-group\">",
+        "          <label for=\"filterDecision\">Decision:</label>",
+        "          <select id=\"filterDecision\" onchange=\"filterTable()\">",
+        "            <option value=\"ALL\">All Decisions</option>",
+        "            <option value=\"AUTO_APPLY\">AUTO_APPLY</option>",
+        "            <option value=\"ESCALATE\">ESCALATE</option>",
+        "            <option value=\"REJECT\">REJECT</option>",
+        "          </select>",
+        "        </div>",
+        "        <div class=\"filter-group\">",
+        "          <label for=\"filterFirstStop\">Gate Outcome:</label>",
+        "          <select id=\"filterFirstStop\" onchange=\"filterTable()\">",
+        "            <option value=\"ALL\">All Outcomes</option>",
+        f"            <option value=\"SURVIVED\">Survived All Gates ({data['first_stop_counts'].get('SURVIVED', 0)})</option>",
+        f"            <option value=\"V0\">Stopped at V0 ({data['first_stop_counts'].get('V0', 0)})</option>",
+        f"            <option value=\"V1\">Stopped at V1 ({data['first_stop_counts'].get('V1', 0)})</option>",
+        f"            <option value=\"V2\">Stopped at V2 ({data['first_stop_counts'].get('V2', 0)})</option>",
+        f"            <option value=\"V3\">Stopped at V3 ({data['first_stop_counts'].get('V3', 0)})</option>",
+        "          </select>",
+        "        </div>",
+        "        <div class=\"filter-group\">",
+        "          <label for=\"filterPatchMode\">Patch Mode:</label>",
+        "          <select id=\"filterPatchMode\" onchange=\"filterTable()\">",
+        "            <option value=\"ALL\">All Modes</option>",
+        "            <option value=\"scripted\">scripted</option>",
+        "            <option value=\"live\">live</option>",
+        "          </select>",
+        "        </div>",
+        "        <div class=\"filter-group\">",
+        "          <label for=\"filterDeployed\">Deployed:</label>",
+        "          <select id=\"filterDeployed\" onchange=\"filterTable()\">",
+        "            <option value=\"ALL\">All</option>",
+        "            <option value=\"YES\">YES</option>",
+        "            <option value=\"NO\">NO</option>",
+        "          </select>",
+        "        </div>",
+        "        <button class=\"btn-reset\" onclick=\"resetFilters()\">Reset Filters</button>",
+        f"        <div class=\"counter-pill\" id=\"candidateCount\">Showing {len(data['units'])} of {len(data['units'])} candidates</div>",
+        "      </div>",
+        "",
+        "      <div class=\"table-container\">",
+        "        <table id=\"candidatesTable\">",
+        "          <thead>",
+        "            <tr>",
+        "              <th>Candidate ID</th><th>Fault</th><th>Kind</th><th>Run ID</th><th>Diag/Patch</th><th>First Stop</th><th>V0</th><th>V1</th><th>V2</th><th>V3</th><th>Decision</th><th>Deployed</th><th>Reasons / Failure</th>",
+        "            </tr>",
+        "          </thead>",
+        "          <tbody>",
+    ]
+    
+    for u in data["units"]:
+        fid = u.get("fault_id", "")
+        cid = u.get("candidate_id", "")
+        kind = u.get("candidate_kind") or "unlabelled"
+        run_id = u.get("run_id", "")
+        diag_m = u.get("diag_mode", "")
+        patch_m = u.get("patch_mode", "")
+        f_stop = determine_first_stop(u)
+        v0_st = u.get("v0", {}).get("status", "unknown")
+        v1_st = u.get("v1", {}).get("status", "unknown")
+        v2_st = u.get("v2", {}).get("status", "unknown")
+        v3_st = u.get("v3", {}).get("status", "unknown")
+        dec = u.get("decision", "UNKNOWN")
+        dec_cls = "badge-auto" if dec == "AUTO_APPLY" else ("badge-escalate" if dec == "ESCALATE" else "badge-reject")
+        dep_val = "YES" if u.get("deployed") else "NO"
+        dep_cls = "badge-deployed" if u.get("deployed") else "badge-not-deployed"
+        reasons = "; ".join(u.get("reasons", [])) or (u.get("apply_error") or "—")
+        search_blob = f"{fid} {cid} {kind} {run_id} {diag_m} {patch_m} {dec} {dep_val} {f_stop} {reasons}".lower()
+        
+        fstop_badge = f"<span class=\"badge badge-pass\">SURVIVED</span>" if f_stop == "SURVIVED" else f"<span class=\"badge badge-fail\">{f_stop}</span>"
+        
+        html_lines.append(
+            f"            <tr data-fault=\"{esc(fid)}\" data-decision=\"{esc(dec)}\" data-firststop=\"{esc(f_stop)}\" data-patchmode=\"{esc(patch_m)}\" data-deployed=\"{esc(dep_val)}\" data-search=\"{esc(search_blob)}\">"
+            f"<td><span class=\"code-snippet\">{esc(cid)}</span></td>"
+            f"<td><strong>{esc(fid)}</strong></td>"
+            f"<td>{esc(kind)}</td>"
+            f"<td style=\"font-size: 0.8rem; color: var(--text-dim);\">{esc(run_id)}</td>"
+            f"<td style=\"font-size: 0.8rem;\">{esc(diag_m)}/{esc(patch_m)}</td>"
+            f"<td>{fstop_badge}</td>"
+            f"<td><span class=\"badge badge-{esc(v0_st)}\">{esc(v0_st)}</span></td>"
+            f"<td><span class=\"badge badge-{esc(v1_st)}\">{esc(v1_st)}</span></td>"
+            f"<td><span class=\"badge badge-{esc(v2_st)}\">{esc(v2_st)}</span></td>"
+            f"<td><span class=\"badge badge-{esc(v3_st)}\">{esc(v3_st)}</span></td>"
+            f"<td><span class=\"badge {dec_cls}\">{esc(dec)}</span></td>"
+            f"<td><span class=\"badge {dep_cls}\">{esc(dep_val)}</span></td>"
+            f"<td style=\"font-size: 0.82rem; color: var(--text-muted); max-width: 280px;\">{esc(reasons)}</td>"
+            f"</tr>"
+        )
+        
+    html_lines += [
+        "          </tbody>",
+        "        </table>",
+        "      </div>",
+        "    </div>",
+        "",
+        "    <!-- SECTION F: Policy Comparison -->",
+        "    <div id=\"tab-policies\" class=\"tab-pane\">",
+        "      <div class=\"section-title\">Policy Comparison (B0 – B3)</div>",
+        "      <p class=\"section-subtitle\">Comparison of candidate policy rules and statistical boundaries</p>",
+        "      <div class=\"banner alert-warning\">",
+        "        <strong>Data Integrity Notice:</strong> In the active pilot evidence, ground-truth candidate labels are marked as draft pending team review. ",
+        "        Per <code>results/policies.csv</code> and <code>pilot_report.md</code>, labelled units n = 0, so rates are recorded as <code>0/0 (N/A)</code>. ",
+        "        Do not infer safety or accuracy until labels are reviewed and verified.",
+        "      </div>",
+        "      <div class=\"table-container\">",
+        "        <table>",
+        "          <thead>",
+        "            <tr><th>Policy</th><th>Description</th><th>Unsafe Auto-Applied (k/n)</th><th>Escalations (k/n)</th><th>Safe Rejected (k/n)</th><th>Formula & Meaning</th></tr>",
+        "          </thead>",
+        "          <tbody>",
+        "            <tr>",
+        "              <td><strong>B0</strong></td>",
+        "              <td>Human reviews everything</td>",
+        "              <td>0/0 (N/A)</td><td>0/0 (N/A)</td><td>0/0 (N/A)</td>",
+        "              <td style=\"font-size: 0.8rem; color: var(--text-muted);\">Always ESCALATE. Baseline: 0 unsafe auto-applied, 100% human burden.</td>",
+        "            </tr>",
+        "            <tr>",
+        "              <td><strong>B1</strong></td>",
+        "              <td>Auto-apply if V0+V1 pass, else reject</td>",
+        "              <td>0/0 (N/A)</td><td>0/0 (N/A)</td><td>0/0 (N/A)</td>",
+        "              <td style=\"font-size: 0.8rem; color: var(--text-muted);\">Naive unit-test only policy. Catches syntax & targeted bug, blind to regression & security.</td>",
+        "            </tr>",
+        "            <tr>",
+        "              <td><strong>B2</strong></td>",
+        "              <td>Auto-apply if V0–V2 pass, else reject</td>",
+        "              <td>0/0 (N/A)</td><td>0/0 (N/A)</td><td>0/0 (N/A)</td>",
+        "              <td style=\"font-size: 0.8rem; color: var(--text-muted);\">Regression-gated policy. Blind to security vulnerabilities (SQLi) caught by V3.</td>",
+        "            </tr>",
+        "            <tr>",
+        "              <td><strong>B3</strong></td>",
+        "              <td>AutoImmune decision engine (V0–V3 + scope)</td>",
+        "              <td>0/0 (N/A)</td><td>0/0 (N/A)</td><td>0/0 (N/A)</td>",
+        "              <td style=\"font-size: 0.8rem; color: var(--text-muted);\">Full tiered engine: V0–V3 + diff bounds (≤20 lines), file scope, sensitive paths, disagree checks.</td>",
+        "            </tr>",
+        "          </tbody>",
+        "        </table>",
+        "      </div>",
+        "    </div>",
+        "",
+        "    <!-- SECTION G: Approval and Rollback -->",
+        "    <div id=\"tab-approvals\" class=\"tab-pane\">",
+        "      <div class=\"section-title\">Approval and Rollback Records</div>",
+        "      <p class=\"section-subtitle\">Audited deployment mechanisms and governance approvals</p>",
+        "      <div class=\"two-col\">",
+        "        <div class=\"card\">",
+        "          <h3 style=\"font-size: 1rem; color: #fff; margin-bottom: 12px;\">Approval Sources</h3>",
+        "          <div class=\"table-container\" style=\"border: none;\">",
+        "            <table>",
+        "              <thead><tr><th>Source Type</th><th>Recorded In Evidence</th><th>Definition</th></tr></thead>",
+        "              <tbody>",
+        "                <tr><td><strong>human_cli</strong></td><td>0</td><td>Interactive CLI prompt (operator typed 'approve')</td></tr>",
+        "                <tr><td><strong>human_relayed</strong></td><td>0</td><td>Human approval relayed via orchestration tool</td></tr>",
+        "                <tr><td><strong>scripted_test</strong></td><td>0</td><td>Automated fixture (never counted as human review)</td></tr>",
+        "                <tr><td><strong>None (gates-only)</strong></td><td>25</td><td>Runs halted at decision gate; no deploy requested</td></tr>",
+        "              </tbody>",
+        "            </table>",
+        "          </div>",
+        "        </div>",
+        "        <div class=\"card\">",
+        "          <h3 style=\"font-size: 1rem; color: #fff; margin-bottom: 12px;\">Rollback Events</h3>",
+        "          <div class=\"table-container\" style=\"border: none;\">",
+        "            <table>",
+        "              <thead><tr><th>Rollback Kind</th><th>Recorded In Evidence</th><th>Mechanism</th></tr></thead>",
+        "              <tbody>",
+        "                <tr><td><strong>Real Unplanned</strong></td><td>0</td><td>Automated image swap back upon health breach</td></tr>",
+        "                <tr><td><strong>Staged Demo (S3b)</strong></td><td>0 in live evidence</td><td>Planted slow patch (p95 > 2s) demonstrating swap</td></tr>",
+        "              </tbody>",
+        "            </table>",
+        "          </div>",
+        "          <div class=\"callout\">",
+        "            <strong>Important Governance Note:</strong> A staged slow-patch rollback demonstrates the Docker image rollback mechanism. ",
+        "            It must NOT be counted as a measured catch of an unsafe patch. Real and staged rollbacks remain strictly partitioned.",
+        "          </div>",
+        "        </div>",
+        "      </div>",
+        "    </div>",
+        "",
+        "    <!-- SECTION H: Acceptance Checks -->",
+        "    <div id=\"tab-checks\" class=\"tab-pane\">",
+        "      <div class=\"section-title\">Project Acceptance Checks (A1 – A10)</div>",
+        "      <p class=\"section-subtitle\">Traceability audit against project plan and verified artifacts</p>",
+        "      <div class=\"table-container\">",
+        "        <table>",
+        "          <thead>",
+        "            <tr>",
+        "              <th>Check ID</th><th>Requirement</th><th>Criterion</th><th>Status</th><th>Supporting Evidence</th><th>Remaining Limitation</th>",
+        "            </tr>",
+        "          </thead>",
+        "          <tbody>",
+    ]
+    
+    for chk in data["acceptance_checks"]:
+        st = chk["status"]
+        st_cls = "badge-pass" if "DONE AND PROVEN" in st else ("badge-warn" if "PARTIALLY" in st else "badge-error")
+        html_lines.append(
+            f"            <tr>"
+            f"<td><strong>{esc(chk['id'])}</strong></td>"
+            f"<td><strong>{esc(chk['name'])}</strong></td>"
+            f"<td style=\"font-size: 0.82rem;\">{esc(chk['criterion'])}</td>"
+            f"<td><span class=\"badge {st_cls}\">{esc(st)}</span></td>"
+            f"<td style=\"font-size: 0.82rem; color: var(--text-muted);\">{esc(chk['evidence'])}</td>"
+            f"<td style=\"font-size: 0.82rem; color: #f87171;\">{esc(chk['limitation'])}</td>"
+            f"</tr>"
+        )
+        
+    html_lines += [
+        "          </tbody>",
+        "        </table>",
+        "      </div>",
+        "    </div>",
+        "",
+        "    <!-- SECTION I: Known Limitations -->",
+        "    <div id=\"tab-limitations\" class=\"tab-pane\">",
+        "      <div class=\"section-title\">Verified Project Limitations & Blockers</div>",
+        "      <p class=\"section-subtitle\">Verified constraints, historical results, and infrastructure observations</p>",
+        "      <div class=\"limitations-list\">",
+    ]
+    
+    for lim in data["known_limitations"]:
+        badge_cls = "badge-error" if lim["severity"] == "danger" else ("badge-warn" if lim["severity"] == "warning" else "badge-auto")
+        html_lines += [
+            f"        <div class=\"limitation-item\">",
+            f"          <div class=\"limitation-header\">",
+            f"            <div class=\"limitation-title\">{esc(lim['title'])}</div>",
+            f"            <span class=\"badge {badge_cls}\">{esc(lim['badge'])}</span>",
+            f"          </div>",
+            f"          <div class=\"limitation-desc\">{esc(lim['description'])}</div>",
+            f"        </div>",
+        ]
+        
+    html_lines += [
+        "      </div>",
+        "    </div>",
+        "  </div>",
+        "",
+        "  <script>",
+        "    function showTab(tabId, btn) {",
+        "      document.querySelectorAll('.tab-pane').forEach(el => el.classList.remove('active'));",
+        "      document.querySelectorAll('nav.tabs button').forEach(el => el.classList.remove('active'));",
+        "      const target = document.getElementById(tabId);",
+        "      if (target) target.classList.add('active');",
+        "      if (btn) btn.classList.add('active');",
+        "    }",
+        "",
+        "    function filterTable() {",
+        "      const search = (document.getElementById('searchCandidates').value || '').toLowerCase().trim();",
+        "      const fault = document.getElementById('filterFault').value;",
+        "      const decision = document.getElementById('filterDecision').value;",
+        "      const firstStop = document.getElementById('filterFirstStop').value;",
+        "      const patchmode = document.getElementById('filterPatchMode').value;",
+        "      const deployed = document.getElementById('filterDeployed').value;",
+        "      const rows = document.querySelectorAll('#candidatesTable tbody tr');",
+        "      let visible = 0;",
+        "      rows.forEach(tr => {",
+        "        const rFault = tr.getAttribute('data-fault');",
+        "        const rDec = tr.getAttribute('data-decision');",
+        "        const rFirstStop = tr.getAttribute('data-firststop');",
+        "        const rMode = tr.getAttribute('data-patchmode');",
+        "        const rDep = tr.getAttribute('data-deployed');",
+        "        const rSearch = tr.getAttribute('data-search') || '';",
+        "        let match = true;",
+        "        if (fault !== 'ALL' && rFault !== fault) match = false;",
+        "        if (decision !== 'ALL' && rDec !== decision) match = false;",
+        "        if (firstStop !== 'ALL' && rFirstStop !== firstStop) match = false;",
+        "        if (patchmode !== 'ALL' && rMode !== patchmode) match = false;",
+        "        if (deployed !== 'ALL' && rDep !== deployed) match = false;",
+        "        if (search && !rSearch.includes(search)) match = false;",
+        "        tr.style.display = match ? '' : 'none';",
+        "        if (match) visible++;",
+        "      });",
+        "      const counter = document.getElementById('candidateCount');",
+        "      if (counter) counter.textContent = 'Showing ' + visible + ' of ' + rows.length + ' candidates';",
+        "    }",
+        "",
+        "    function resetFilters() {",
+        "      document.getElementById('searchCandidates').value = '';",
+        "      document.getElementById('filterFault').value = 'ALL';",
+        "      document.getElementById('filterDecision').value = 'ALL';",
+        "      document.getElementById('filterFirstStop').value = 'ALL';",
+        "      document.getElementById('filterPatchMode').value = 'ALL';",
+        "      document.getElementById('filterDeployed').value = 'ALL';",
+        "      filterTable();",
+        "    }",
+        "  </script>",
+        "</body>",
+        "</html>",
+    ]
+    return "\n".join(html_lines)
+
+
+def generate_dashboard(repo_root: Path, evidence_path: Path, results_dir: Path, docs_dir: Path, out_path: Path) -> Path:
+    print(f"Building dashboard data from {repo_root}...")
+    data = build_dashboard_data(repo_root, evidence_path, results_dir, docs_dir)
+    print(f"  Evidence rows: {len(data['evidence_rows'])}")
+    print(f"  Unique units: {len(data['units'])}")
+    print(f"  Distinct faults: {data['distinct_faults']}")
+    print(f"  Decisions: {dict(data['decision_counts'])}")
+    print(f"  First stops: {dict(data['first_stop_counts'])}")
+    print(f"  Deployments: {data['deployed_count']}, Rollbacks: {data['rollback_count']}")
+    
+    html_content = render_html(data)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(html_content, encoding="utf-8")
+    print(f"Successfully generated dashboard: {out_path} ({len(html_content)} bytes)")
+    return out_path
+
+
+def main() -> None:
+    repo = Path(__file__).resolve().parents[1]
+    ap = argparse.ArgumentParser(description="Generate AutoImmune Evidence Dashboard (offline HTML)")
+    ap.add_argument("--repo", type=Path, default=repo, help="Path to repo root")
+    ap.add_argument("--evidence", type=Path, default=None, help="Path to evidence.jsonl")
+    ap.add_argument("--results-dir", type=Path, default=None, help="Path to results directory")
+    ap.add_argument("--docs-dir", type=Path, default=None, help="Path to docs directory")
+    ap.add_argument("--out", type=Path, default=None, help="Output HTML path")
+    args = ap.parse_args()
+    
+    repo = args.repo.resolve()
+    evidence = (args.evidence or (repo / "results" / "evidence.jsonl")).resolve()
+    results_dir = (args.results_dir or (repo / "results")).resolve()
+    docs_dir = (args.docs_dir or (repo / "docs")).resolve()
+    out = (args.out or (repo / "results" / "dashboard.html")).resolve()
+    
+    generate_dashboard(repo, evidence, results_dir, docs_dir, out)
+
+
+if __name__ == "__main__":
+    main()

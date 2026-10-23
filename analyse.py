@@ -310,8 +310,8 @@ def analyse(evidence: Path, faults_dir: Path) -> tuple[dict[str, str], str]:
                                   k3, n_eval, r4(k3 / n_eval if n_eval else None), r4(lo3), r4(hi3)])
             diag_md_rows.append([f, m, fmt_rate(k1, n_eval), fmt_rate(k3, n_eval), n_eval])
 
-        files["llm_diagnosis.csv"] = csv_text(["fault", "model", "top1_k", "n", "top1_rate", "top1_low", "top1_high",
-                                               "top3_k", "n", "top3_rate", "top3_low", "top3_high"], diag_csv_rows)
+        files["llm_diagnosis.csv"] = csv_text(["fault", "model", "top1_k", "top1_n", "top1_rate", "top1_low", "top1_high",
+                                               "top3_k", "top3_n", "top3_rate", "top3_low", "top3_high"], diag_csv_rows)
 
         md += [
             "## e) LLM candidates and diagnosis",
